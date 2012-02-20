@@ -33,6 +33,7 @@
 #include <linux/prctl.h>
 
 #include <private/android_filesystem_config.h>
+#include "hardware/qemu_pipe.h"
 
 #define LIB_PATH_PROPERTY   "rild.libpath"
 #define LIB_ARGS_PROPERTY   "rild.libargs"
@@ -91,7 +92,7 @@ void switchUser() {
     struct __user_cap_data_struct cap;
     header.version = _LINUX_CAPABILITY_VERSION;
     header.pid = 0;
-    cap.effective = cap.permitted = 1 << CAP_NET_ADMIN;
+    cap.effective = cap.permitted = (1 << CAP_NET_ADMIN) | (1 << CAP_NET_RAW);
     cap.inheritable = 0;
     capset(&header, &cap);
 }
@@ -108,6 +109,7 @@ int main(int argc, char **argv)
 
     int i;
 
+    umask(S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
     for (i = 1; i < argc ;) {
         if (0 == strcmp(argv[i], "-l") && (argc - i > 1)) {
             rilLibPath = argv[i + 1];
@@ -174,11 +176,13 @@ int main(int argc, char **argv)
 
                 sleep(1);
 
-                fd = socket_local_client(
-                            QEMUD_SOCKET_NAME,
-                            ANDROID_SOCKET_NAMESPACE_RESERVED,
-                            SOCK_STREAM );
-
+                fd = qemu_pipe_open("qemud:gsm");
+                if (fd < 0) {
+                    fd = socket_local_client(
+                                QEMUD_SOCKET_NAME,
+                                ANDROID_SOCKET_NAMESPACE_RESERVED,
+                                SOCK_STREAM );
+                }
                 if (fd >= 0) {
                     close(fd);
                     snprintf( arg_device, sizeof(arg_device), "%s/%s",

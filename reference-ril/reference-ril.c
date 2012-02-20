@@ -15,7 +15,6 @@
 ** limitations under the License.
 */
 
-#include <telephony/ril.h>
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
@@ -33,6 +32,10 @@
 #include <sys/socket.h>
 #include <cutils/sockets.h>
 #include <termios.h>
+#include <sys/system_properties.h>
+
+#include "ril.h"
+#include "hardware/qemu_pipe.h"
 
 #define LOG_TAG "RIL"
 #include <utils/Log.h>
@@ -40,7 +43,7 @@
 #define MAX_AT_RESPONSE 0x1000
 
 /* pathname returned from RIL_REQUEST_SETUP_DATA_CALL / RIL_REQUEST_SETUP_DEFAULT_PDP */
-#define PPP_TTY_PATH "/dev/omap_csmi_tty1"
+#define PPP_TTY_PATH "eth0"
 
 #ifdef USE_TI_COMMANDS
 
@@ -63,7 +66,7 @@ typedef enum {
     SIM_PIN = 3,
     SIM_PUK = 4,
     SIM_NETWORK_PERSONALIZATION = 5
-} SIM_Status; 
+} SIM_Status;
 
 static void onRequest (int request, void *data, size_t datalen, RIL_Token t);
 static RIL_RadioState currentState();
@@ -72,8 +75,8 @@ static void onCancel (RIL_Token t);
 static const char *getVersion();
 static int isRadioOn();
 static SIM_Status getSIMStatus();
-static int getCardStatus(RIL_CardStatus **pp_card_status);
-static void freeCardStatus(RIL_CardStatus *p_card_status);
+static int getCardStatus(RIL_CardStatus_v6 **pp_card_status);
+static void freeCardStatus(RIL_CardStatus_v6 *p_card_status);
 static void onDataCallListChanged(void *param);
 
 extern const char * requestToString(int request);
@@ -315,19 +318,25 @@ static void requestOrSendDataCallList(RIL_Token *t)
          p_cur = p_cur->p_next)
         n++;
 
-    RIL_Data_Call_Response *responses =
-        alloca(n * sizeof(RIL_Data_Call_Response));
+    RIL_Data_Call_Response_v6 *responses =
+        alloca(n * sizeof(RIL_Data_Call_Response_v6));
 
     int i;
     for (i = 0; i < n; i++) {
+        responses[i].status = -1;
+#ifndef HCRADIO
+        responses[i].suggestedRetryTime = -1;
+#endif
         responses[i].cid = -1;
         responses[i].active = -1;
         responses[i].type = "";
-        responses[i].apn = "";
-        responses[i].address = "";
+        responses[i].ifname = "";
+        responses[i].addresses = "";
+        responses[i].dnses = "";
+        responses[i].gateways = "";
     }
 
-    RIL_Data_Call_Response *response = responses;
+    RIL_Data_Call_Response_v6 *response = responses;
     for (p_cur = p_response->p_intermediates; p_cur != NULL;
          p_cur = p_cur->p_next) {
         char *line = p_cur->line;
@@ -363,10 +372,6 @@ static void requestOrSendDataCallList(RIL_Token *t)
          p_cur = p_cur->p_next) {
         char *line = p_cur->line;
         int cid;
-        char *type;
-        char *apn;
-        char *address;
-
 
         err = at_tok_start(&line);
         if (err < 0)
@@ -386,37 +391,88 @@ static void requestOrSendDataCallList(RIL_Token *t)
             continue;
         }
 
+        // Assume no error
+        responses[i].status = 0;
+
+        // type
         err = at_tok_nextstr(&line, &out);
         if (err < 0)
             goto error;
-
         responses[i].type = alloca(strlen(out) + 1);
         strcpy(responses[i].type, out);
 
+        // APN ignored for v5
         err = at_tok_nextstr(&line, &out);
         if (err < 0)
             goto error;
 
-        responses[i].apn = alloca(strlen(out) + 1);
-        strcpy(responses[i].apn, out);
+        responses[i].ifname = alloca(strlen(PPP_TTY_PATH) + 1);
+        strcpy(responses[i].ifname, PPP_TTY_PATH);
 
         err = at_tok_nextstr(&line, &out);
         if (err < 0)
             goto error;
 
-        responses[i].address = alloca(strlen(out) + 1);
-        strcpy(responses[i].address, out);
+        responses[i].addresses = alloca(strlen(out) + 1);
+        strcpy(responses[i].addresses, out);
+
+        {
+            char  propValue[PROP_VALUE_MAX];
+
+            if (__system_property_get("ro.kernel.qemu", propValue) != 0) {
+                /* We are in the emulator - the dns servers are listed
+                 * by the following system properties, setup in
+                 * /system/etc/init.goldfish.sh:
+                 *  - net.eth0.dns1
+                 *  - net.eth0.dns2
+                 *  - net.eth0.dns3
+                 *  - net.eth0.dns4
+                 */
+                const int   dnslist_sz = 128;
+                char*       dnslist = alloca(dnslist_sz);
+                const char* separator = "";
+                int         nn;
+
+                dnslist[0] = 0;
+                for (nn = 1; nn <= 4; nn++) {
+                    /* Probe net.eth0.dns<n> */
+                    char  propName[PROP_NAME_MAX];
+                    snprintf(propName, sizeof propName, "net.eth0.dns%d", nn);
+
+                    /* Ignore if undefined */
+                    if (__system_property_get(propName, propValue) == 0) {
+                        continue;
+                    }
+
+                    /* Append the DNS IP address */
+                    strlcat(dnslist, separator, dnslist_sz);
+                    strlcat(dnslist, propValue, dnslist_sz);
+                    separator = " ";
+                }
+                responses[i].dnses = dnslist;
+
+                /* There is only on gateway in the emulator */
+                responses[i].gateways = "10.0.2.2";
+            }
+            else {
+                /* I don't know where we are, so use the public Google DNS
+                 * servers by default and no gateway.
+                 */
+                responses[i].dnses = "8.8.8.8 8.8.4.4";
+                responses[i].gateways = "";
+            }
+        }
     }
 
     at_response_free(p_response);
 
     if (t != NULL)
         RIL_onRequestComplete(*t, RIL_E_SUCCESS, responses,
-                              n * sizeof(RIL_Data_Call_Response));
+                              n * sizeof(RIL_Data_Call_Response_v6));
     else
         RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED,
                                   responses,
-                                  n * sizeof(RIL_Data_Call_Response));
+                                  n * sizeof(RIL_Data_Call_Response_v6));
 
     return;
 
@@ -723,10 +779,10 @@ static void requestRegistrationState(int request, void *data,
     int count = 3;
 
 
-    if (request == RIL_REQUEST_REGISTRATION_STATE) {
+    if (request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
         cmd = "AT+CREG?";
         prefix = "+CREG:";
-    } else if (request == RIL_REQUEST_GPRS_REGISTRATION_STATE) {
+    } else if (request == RIL_REQUEST_DATA_REGISTRATION_STATE) {
         cmd = "AT+CGREG?";
         prefix = "+CGREG:";
     } else {
@@ -960,7 +1016,6 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     char *cmd;
     int err;
     ATResponse *p_response = NULL;
-    char *response[2] = { "1", PPP_TTY_PATH };
 
     apn = ((const char **)data)[2];
 
@@ -978,22 +1033,23 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     ssize_t written, rlen;
     char status[32] = {0};
     int retry = 10;
+    const char *pdp_type;
 
     LOGD("requesting data connection to APN '%s'", apn);
 
     fd = open ("/dev/qmi", O_RDWR);
     if (fd >= 0) { /* the device doesn't exist on the emulator */
 
-	    LOGD("opened the qmi device\n");
-	    asprintf(&cmd, "up:%s", apn);
-	    len = strlen(cmd);
+        LOGD("opened the qmi device\n");
+        asprintf(&cmd, "up:%s", apn);
+        len = strlen(cmd);
 
-	    while (cur < len) {
-		    do {
-	            written = write (fd, cmd + cur, len - cur);
-	        } while (written < 0 && errno == EINTR);
+        while (cur < len) {
+            do {
+                written = write (fd, cmd + cur, len - cur);
+            } while (written < 0 && errno == EINTR);
 
-	        if (written < 0) {
+            if (written < 0) {
                 LOGE("### ERROR writing to /dev/qmi");
                 close(fd);
                 goto error;
@@ -1024,43 +1080,50 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 
         if (retry == 0) {
             LOGE("### Failed to get data connection up\n");
-	        goto error;
-		}
+            goto error;
+        }
 
         qmistatus = system("netcfg rmnet0 dhcp");
 
         LOGD("netcfg rmnet0 dhcp: status %d\n", qmistatus);
 
-	    if (qmistatus < 0) goto error;
+        if (qmistatus < 0) goto error;
 
-	} else {
+    } else {
 
-        asprintf(&cmd, "AT+CGDCONT=1,\"IP\",\"%s\",,0,0", apn);
-	    //FIXME check for error here
-	    err = at_send_command(cmd, NULL);
-	    free(cmd);
+        if (datalen > 6 * sizeof(char *)) {
+            pdp_type = ((const char **)data)[6];
+        } else {
+            pdp_type = "IP";
+        }
 
-	    // Set required QoS params to default
-	    err = at_send_command("AT+CGQREQ=1", NULL);
+        asprintf(&cmd, "AT+CGDCONT=1,\"%s\",\"%s\",,0,0", pdp_type, apn);
+        //FIXME check for error here
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
-	    // Set minimum QoS params to default
-	    err = at_send_command("AT+CGQMIN=1", NULL);
+        // Set required QoS params to default
+        err = at_send_command("AT+CGQREQ=1", NULL);
 
-	    // packet-domain event reporting
-	    err = at_send_command("AT+CGEREP=1,0", NULL);
+        // Set minimum QoS params to default
+        err = at_send_command("AT+CGQMIN=1", NULL);
 
-	    // Hangup anything that's happening there now
-	    err = at_send_command("AT+CGACT=1,0", NULL);
+        // packet-domain event reporting
+        err = at_send_command("AT+CGEREP=1,0", NULL);
 
-	    // Start data on PDP context 1
-	    err = at_send_command("ATD*99***1#", &p_response);
+        // Hangup anything that's happening there now
+        err = at_send_command("AT+CGACT=1,0", NULL);
 
-	    if (err < 0 || p_response->success == 0) {
-	        goto error;
-	    }
+        // Start data on PDP context 1
+        err = at_send_command("ATD*99***1#", &p_response);
+
+        if (err < 0 || p_response->success == 0) {
+            goto error;
+        }
     }
 
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
+    requestOrSendDataCallList(&t);
+
     at_response_free(p_response);
 
     return;
@@ -1098,12 +1161,12 @@ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
     RIL_SIM_IO_Response sr;
     int err;
     char *cmd = NULL;
-    RIL_SIM_IO *p_args;
+    RIL_SIM_IO_v6 *p_args;
     char *line;
 
     memset(&sr, 0, sizeof(sr));
 
-    p_args = (RIL_SIM_IO *)data;
+    p_args = (RIL_SIM_IO_v6 *)data;
 
     /* FIXME handle pin2 */
 
@@ -1237,7 +1300,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
 
     switch (request) {
         case RIL_REQUEST_GET_SIM_STATUS: {
-            RIL_CardStatus *p_card_status;
+            RIL_CardStatus_v6 *p_card_status;
             char *p_buffer;
             int buffer_size;
 
@@ -1347,8 +1410,8 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_SIGNAL_STRENGTH:
             requestSignalStrength(data, datalen, t);
             break;
-        case RIL_REQUEST_REGISTRATION_STATE:
-        case RIL_REQUEST_GPRS_REGISTRATION_STATE:
+        case RIL_REQUEST_VOICE_REGISTRATION_STATE:
+        case RIL_REQUEST_DATA_REGISTRATION_STATE:
             requestRegistrationState(request, data, datalen, t);
             break;
         case RIL_REQUEST_OPERATOR:
@@ -1573,7 +1636,7 @@ setRadioState(RIL_RadioState newState)
 }
 
 /** Returns SIM_NOT_READY on error */
-static SIM_Status 
+static SIM_Status
 getSIMStatus()
 {
     ATResponse *p_response = NULL;
@@ -1656,7 +1719,7 @@ done:
  * This must be freed using freeCardStatus.
  * @return: On success returns RIL_E_SUCCESS
  */
-static int getCardStatus(RIL_CardStatus **pp_card_status) {
+static int getCardStatus(RIL_CardStatus_v6 **pp_card_status) {
     static RIL_AppStatus app_status_array[] = {
         // SIM_ABSENT = 0
         { RIL_APPTYPE_UNKNOWN, RIL_APPSTATE_UNKNOWN, RIL_PERSOSUBSTATE_UNKNOWN,
@@ -1690,11 +1753,12 @@ static int getCardStatus(RIL_CardStatus **pp_card_status) {
     }
 
     // Allocate and initialize base card status.
-    RIL_CardStatus *p_card_status = malloc(sizeof(RIL_CardStatus));
+    RIL_CardStatus_v6 *p_card_status = malloc(sizeof(RIL_CardStatus_v6));
     p_card_status->card_state = card_state;
     p_card_status->universal_pin_state = RIL_PINSTATE_UNKNOWN;
     p_card_status->gsm_umts_subscription_app_index = RIL_CARD_MAX_APPS;
     p_card_status->cdma_subscription_app_index = RIL_CARD_MAX_APPS;
+    p_card_status->ims_subscription_app_index = RIL_CARD_MAX_APPS;
     p_card_status->num_applications = num_apps;
 
     // Initialize application status
@@ -1721,7 +1785,7 @@ static int getCardStatus(RIL_CardStatus **pp_card_status) {
 /**
  * Free the card status returned by getCardStatus
  */
-static void freeCardStatus(RIL_CardStatus *p_card_status) {
+static void freeCardStatus(RIL_CardStatus_v6 *p_card_status) {
     free(p_card_status);
 }
 
@@ -1934,7 +1998,7 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
                 || strStartsWith(s,"+CGREG:")
     ) {
         RIL_onUnsolicitedResponse (
-            RIL_UNSOL_RESPONSE_NETWORK_STATE_CHANGED,
+            RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED,
             NULL, 0);
 #ifdef WORKAROUND_FAKE_CGEV
         RIL_requestTimedCallback (onDataCallListChanged, NULL, NULL);
@@ -2011,21 +2075,28 @@ mainLoop(void *param)
                 fd = socket_loopback_client(s_port, SOCK_STREAM);
             } else if (s_device_socket) {
                 if (!strcmp(s_device_path, "/dev/socket/qemud")) {
-                    /* Qemu-specific control socket */
-                    fd = socket_local_client( "qemud",
-                                              ANDROID_SOCKET_NAMESPACE_RESERVED,
-                                              SOCK_STREAM );
-                    if (fd >= 0 ) {
-                        char  answer[2];
+                    /* Before trying to connect to /dev/socket/qemud (which is
+                     * now another "legacy" way of communicating with the
+                     * emulator), we will try to connecto to gsm service via
+                     * qemu pipe. */
+                    fd = qemu_pipe_open("qemud:gsm");
+                    if (fd < 0) {
+                        /* Qemu-specific control socket */
+                        fd = socket_local_client( "qemud",
+                                                  ANDROID_SOCKET_NAMESPACE_RESERVED,
+                                                  SOCK_STREAM );
+                        if (fd >= 0 ) {
+                            char  answer[2];
 
-                        if ( write(fd, "gsm", 3) != 3 ||
-                             read(fd, answer, 2) != 2 ||
-                             memcmp(answer, "OK", 2) != 0)
-                        {
-                            close(fd);
-                            fd = -1;
-                        }
-                   }
+                            if ( write(fd, "gsm", 3) != 3 ||
+                                 read(fd, answer, 2) != 2 ||
+                                 memcmp(answer, "OK", 2) != 0)
+                            {
+                                close(fd);
+                                fd = -1;
+                            }
+                       }
+                    }
                 }
                 else
                     fd = socket_local_client( s_device_path,
