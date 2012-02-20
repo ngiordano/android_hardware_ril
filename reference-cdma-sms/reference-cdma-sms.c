@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2010 The Android Open Source Project
+/*
+ * Copyright (C) 2008 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,22 @@
  * limitations under the License.
  */
 
-#ifndef _LOGGING_H
-#define _LOGGING_H
 
-// The LOG_TAG should start with "RIL" so it shows up in the  radio log
-#define LOG_TAG "RIL-MOCK"
+#include "reference-cdma-sms.h"
 
+#undef LOG_TAG
+#define LOG_TAG "CDMA"
 #include <utils/Log.h>
 
-#endif
+RIL_Errno wmsts_ril_cdma_decode_sms( RIL_CDMA_Encoded_SMS *  encoded_sms,
+        RIL_CDMA_SMS_ClientBd * client_bd) {
+    LOGE("ril_cdma_decode_sms function not implemented\n");
+    return RIL_E_GENERIC_FAILURE;
+  }
+
+RIL_Errno wmsts_ril_cdma_encode_sms(RIL_CDMA_SMS_ClientBd * client_bd,
+        RIL_CDMA_Encoded_SMS *  encoded_sms) {
+
+    LOGE("ril_cdma_encode_sms function not implemented\n");
+    return RIL_E_GENERIC_FAILURE;
+  }
